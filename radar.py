@@ -43,9 +43,12 @@ def fetch_all_sources():
     try:
         hn_ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10).json()[:100]
         for item_id in hn_ids:
-            item = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json", timeout=5).json()
-            if item and "title" in item:
-                items.append(f"[HN] {item['title']}")
+            try:
+                item = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json", timeout=5).json()
+                if item and "title" in item:
+                    items.append(f"[HN] {item['title']}")
+            except Exception:
+                continue
     except Exception as e:
         print(f"HN 抓取异常: {e}")
 
@@ -139,7 +142,44 @@ def detect_anomalies(cur, today_str, today_counts, word_sources):
     return sorted(anomalies, key=lambda x: x["score"], reverse=True)[:22]
 
 
-# ================= 4. 大模型降噪与商机分析（含完整报错诊断） =================
+# ================= 4. 自动发现最新可用 Gemini 模型并分析 =================
+def get_latest_available_models():
+    """自动向 Google 查询当前 Key 真正可调用的最新文本模型，排除已下线的旧版本"""
+    models = []
+    if LLM_MODEL:
+        models.append(LLM_MODEL.replace("models/", ""))
+
+    try:
+        res = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={LLM_API_KEY}",
+            timeout=15
+        )
+        if res.status_code == 200:
+            all_models = res.json().get("models", [])
+            valid_flash = []
+            valid_other = []
+            for m in all_models:
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                # 必须是支持文本生成的 Gemini 模型，排除已知下线旧版及专用多模态模型
+                if "generateContent" in methods and "gemini" in name.lower():
+                    if any(old in name for old in ["2.5", "2.0", "1.5", "1.0", "audio", "image", "tts", "embedding"]):
+                        continue
+                    if "flash" in name.lower():
+                        valid_flash.append(name)
+                    else:
+                        valid_other.append(name)
+            valid_flash.sort(reverse=True)
+            valid_other.sort(reverse=True)
+            models.extend(valid_flash + valid_other)
+    except Exception as e:
+        print(f"获取可用模型列表失败: {e}")
+
+    # 兜底最新别名
+    models.extend(["gemini-3-flash-preview", "gemini-3.0-flash", "gemini-flash-latest"])
+    return list(dict.fromkeys(models))
+
+
 def analyze_with_llm(anomalies, word_contexts):
     if not anomalies:
         return "今日暂无显著的早期趋势异动。"
@@ -168,14 +208,11 @@ def analyze_with_llm(anomalies, word_contexts):
    - **全栈切入机会**：有没有适合独立开发者的 Micro-SaaS、浏览器插件、API 封装或内容工具机会？（无明显商业机会则注明“纯技术追踪”）
 """
 
-    models_to_try = ["gemini-2.5-flash", "gemini-2.5-pro"]
-    if LLM_MODEL:
-        clean_model = LLM_MODEL.replace("models/", "")
-        if clean_model not in models_to_try:
-            models_to_try.insert(0, clean_model)
+    models_to_try = get_latest_available_models()
+    print(f"自动筛选出的可用新模型候选: {models_to_try[:5]}")
 
     error_logs = []
-    for model_name in models_to_try:
+    for model_name in models_to_try[:5]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={LLM_API_KEY}"
         data = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -186,6 +223,7 @@ def analyze_with_llm(anomalies, word_contexts):
                 res = requests.post(url, json=data, timeout=45)
                 if res.status_code == 200:
                     result = res.json()
+                    print(f"✅ 成功使用模型 [{model_name}] 完成分析！")
                     return result["candidates"][0]["content"]["parts"][0]["text"]
 
                 err_msg = f"[{model_name}] 第{attempt+1}次失败 (HTTP {res.status_code}): {res.text[:150]}"
