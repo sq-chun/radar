@@ -12,17 +12,16 @@ import requests
 from bs4 import BeautifulSoup
 
 # ================= 环境变量配置 =================
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-# 可留空，脚本会自动向 Google 查询当前账号可用的最新 Flash 模型
-LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 
 # Lark (国际版飞书) 配置
-LARK_WEBHOOK = os.getenv("LARK_WEBHOOK", "")
-LARK_SECRET = os.getenv("LARK_SECRET", "")
+LARK_WEBHOOK = os.getenv("LARK_WEBHOOK", "").strip()
+LARK_SECRET = os.getenv("LARK_SECRET", "").strip()
 
 # Telegram 配置 (可选)
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 STOP_WORDS = {
     "the", "to", "of", "and", "a", "in", "for", "is", "on", "that", "by",
@@ -140,39 +139,7 @@ def detect_anomalies(cur, today_str, today_counts, word_sources):
     return sorted(anomalies, key=lambda x: x["score"], reverse=True)[:22]
 
 
-# ================= 4. 自动发现可用 Gemini 模型并分析 =================
-def get_available_gemini_models(api_key):
-    """动态查询当前 API Key 可用的 Flash 模型，彻底避免 404"""
-    candidates = []
-    if LLM_MODEL:
-        candidates.append(LLM_MODEL.replace("models/", ""))
-
-    try:
-        res = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            timeout=15
-        )
-        if res.status_code == 200:
-            models = res.json().get("models", [])
-            flash_models = []
-            for m in models:
-                name = m.get("name", "").replace("models/", "")
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods and "flash" in name.lower():
-                    # 排除音频/图像/嵌入等专用实验模型
-                    if not any(x in name.lower() for x in ["audio", "image", "tts", "thinking", "8b"]):
-                        flash_models.append(name)
-            # 按版本号倒序排列，优先使用最新稳定版
-            flash_models.sort(reverse=True)
-            candidates.extend(flash_models)
-    except Exception as e:
-        print(f"查询模型列表异常: {e}")
-
-    # 兜底列表
-    candidates.extend(["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"])
-    return list(dict.fromkeys(candidates))
-
-
+# ================= 4. 大模型降噪与商机分析（含完整报错诊断） =================
 def analyze_with_llm(anomalies, word_contexts):
     if not anomalies:
         return "今日暂无显著的早期趋势异动。"
@@ -187,131 +154,4 @@ def analyze_with_llm(anomalies, word_contexts):
         srcs = ", ".join(item["sources"])
         payload_text += f"- 词条: `{w}` (今日 {item['today']} 次, 7日均 {item['avg_7d']}, 来源平台: {srcs})\n  帖子上下文: {ctx}\n"
 
-    prompt = f"""你是一个敏锐的独立开发者和 SaaS 市场分析师。
-以下是我从 Hacker News、Reddit、GitHub Trending 和 Product Hunt 抓取的【今日词频异常飙升词条】及其上下文：
-
-{payload_text}
-
-请执行以下任务：
-1. **严格降噪**：剔除通用词、日常动作词或泛概念词。
-2. **优先跨平台信号**：重点关注同时在多个平台（如 GitHub + HN 或 Reddit + ProductHunt）冒头的新技术、新协议、新工具或具体用户痛点。
-3. **输出 3-6 个高价值信号**，使用简洁的中文 Markdown 格式，每条包含：
-   - **关键词**（标注来源平台与今日频次）
-   - **早期信号解读**：结合标题，一句话说明为什么它正在被讨论。
-   - **全栈切入机会**：有没有适合独立开发者的 Micro-SaaS、浏览器插件、API 封装或内容工具机会？（无明显商业机会则注明“纯技术追踪”）
-"""
-
-    models_to_try = get_available_gemini_models(LLM_API_KEY)
-    print(f"检测到可用候选模型: {models_to_try[:4]}")
-
-    last_error = ""
-    for model_name in models_to_try[:5]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={LLM_API_KEY}"
-        data = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.3}
-        }
-        for attempt in range(3):
-            try:
-                res = requests.post(url, json=data, timeout=45)
-                if res.status_code == 404:
-                    print(f"[{model_name}] 返回 404，自动切换下一个模型...")
-                    break  # 直接换下一个模型，不浪费时间重试
-                if res.status_code in (429, 500, 502, 503, 504):
-                    wait_sec = (attempt + 1) * 3
-                    print(f"[{model_name}] 遇到瞬时拥堵 {res.status_code}，等待 {wait_sec} 秒后重试...")
-                    time.sleep(wait_sec)
-                    continue
-                res.raise_for_status()
-                result = res.json()
-                return result["candidates"][0]["content"]["parts"][0]["text"]
-            except Exception as e:
-                last_error = f"[{model_name}] {e}"
-                time.sleep(2)
-
-    return f"LLM 分析请求失败（已尝试所有可用模型）: {last_error}"
-
-
-# ================= 5. Lark & Telegram Webhook 推送 =================
-def gen_lark_sign(timestamp, secret):
-    string_to_sign = f"{timestamp}\n{secret}"
-    hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
-    return base64.b64encode(hmac_code).decode("utf-8")
-
-
-def send_to_lark(title, markdown_content):
-    if not LARK_WEBHOOK:
-        return
-
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "blue"
-            },
-            "elements": [
-                {"tag": "markdown", "content": markdown_content}
-            ]
-        }
-    }
-
-    if LARK_SECRET:
-        timestamp = str(int(time.time()))
-        payload["timestamp"] = timestamp
-        payload["sign"] = gen_lark_sign(timestamp, LARK_SECRET)
-
-    try:
-        res = requests.post(LARK_WEBHOOK, json=payload, timeout=10)
-        result = res.json()
-        if result.get("code") == 0 or result.get("StatusCode") == 0:
-            print("Lark 推送成功！")
-        else:
-            print(f"Lark 推送失败: {result}")
-    except Exception as e:
-        print(f"Lark 推送请求异常: {e}")
-
-
-def send_to_telegram(title, markdown_content):
-    if not (TG_BOT_TOKEN and TG_CHAT_ID):
-        return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    text = f"*{title}*\n\n{markdown_content}"
-    try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text[:4000], "parse_mode": "Markdown"}, timeout=10)
-    except Exception as e:
-        print(f"Telegram 推送请求异常: {e}")
-
-
-# ================= 主入口 =================
-if __name__ == "__main__":
-    conn = sqlite3.connect("trends.db")
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS word_stats (
-            date TEXT,
-            word TEXT,
-            count INTEGER,
-            PRIMARY KEY (date, word)
-        )
-    """)
-    conn.commit()
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    items = fetch_all_sources()
-    print(f"[{today}] 四源合计抓取 {len(items)} 条数据。")
-
-    counts, contexts, sources = extract_ngrams_with_context(items)
-    for word, cnt in counts.items():
-        cur.execute("INSERT OR REPLACE INTO word_stats VALUES (?, ?, ?)", (today, word, cnt))
-    conn.commit()
-
-    anomalies = detect_anomalies(cur, today, counts, sources)
-    report = analyze_with_llm(anomalies, contexts)
-
-    report_title = f"📡 早期需求与趋势雷达 ({today})"
-    print("\n" + report_title + "\n" + report)
-
-    send_to_lark(report_title, report)
-    send_to_telegram(report_title, report)
-    conn.close()
+    prompt = f"""你是一个敏锐的
