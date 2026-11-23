@@ -13,8 +13,8 @@ from bs4 import BeautifulSoup
 
 # ================= 环境变量配置 =================
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-flash-latest")
+# 可留空，脚本会自动向 Google 查询当前账号可用的最新 Flash 模型
+LLM_MODEL = os.getenv("LLM_MODEL", "")
 
 # Lark (国际版飞书) 配置
 LARK_WEBHOOK = os.getenv("LARK_WEBHOOK", "")
@@ -140,7 +140,39 @@ def detect_anomalies(cur, today_str, today_counts, word_sources):
     return sorted(anomalies, key=lambda x: x["score"], reverse=True)[:22]
 
 
-# ================= 4. 大模型降噪与商机分析（含 503 自动重试与模型兜底） =================
+# ================= 4. 自动发现可用 Gemini 模型并分析 =================
+def get_available_gemini_models(api_key):
+    """动态查询当前 API Key 可用的 Flash 模型，彻底避免 404"""
+    candidates = []
+    if LLM_MODEL:
+        candidates.append(LLM_MODEL.replace("models/", ""))
+
+    try:
+        res = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            timeout=15
+        )
+        if res.status_code == 200:
+            models = res.json().get("models", [])
+            flash_models = []
+            for m in models:
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods and "flash" in name.lower():
+                    # 排除音频/图像/嵌入等专用实验模型
+                    if not any(x in name.lower() for x in ["audio", "image", "tts", "thinking", "8b"]):
+                        flash_models.append(name)
+            # 按版本号倒序排列，优先使用最新稳定版
+            flash_models.sort(reverse=True)
+            candidates.extend(flash_models)
+    except Exception as e:
+        print(f"查询模型列表异常: {e}")
+
+    # 兜底列表
+    candidates.extend(["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"])
+    return list(dict.fromkeys(candidates))
+
+
 def analyze_with_llm(anomalies, word_contexts):
     if not anomalies:
         return "今日暂无显著的早期趋势异动。"
@@ -169,37 +201,35 @@ def analyze_with_llm(anomalies, word_contexts):
    - **全栈切入机会**：有没有适合独立开发者的 Micro-SaaS、浏览器插件、API 封装或内容工具机会？（无明显商业机会则注明“纯技术追踪”）
 """
 
-    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-    # 主模型拥堵时自动切换备用模型
-    models_to_try = list(dict.fromkeys([LLM_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"]))
+    models_to_try = get_available_gemini_models(LLM_API_KEY)
+    print(f"检测到可用候选模型: {models_to_try[:4]}")
 
     last_error = ""
-    for model_name in models_to_try:
+    for model_name in models_to_try[:5]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={LLM_API_KEY}"
+        data = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3}
+        }
         for attempt in range(3):
             try:
-                data = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3
-                }
-                res = requests.post(
-                    f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
-                    headers=headers,
-                    json=data,
-                    timeout=45
-                )
+                res = requests.post(url, json=data, timeout=45)
+                if res.status_code == 404:
+                    print(f"[{model_name}] 返回 404，自动切换下一个模型...")
+                    break  # 直接换下一个模型，不浪费时间重试
                 if res.status_code in (429, 500, 502, 503, 504):
                     wait_sec = (attempt + 1) * 3
-                    print(f"[{model_name}] 遇到瞬时错误 {res.status_code}，等待 {wait_sec} 秒后重试...")
+                    print(f"[{model_name}] 遇到瞬时拥堵 {res.status_code}，等待 {wait_sec} 秒后重试...")
                     time.sleep(wait_sec)
                     continue
                 res.raise_for_status()
-                return res.json()["choices"][0]["message"]["content"]
+                result = res.json()
+                return result["candidates"][0]["content"]["parts"][0]["text"]
             except Exception as e:
-                last_error = str(e)
+                last_error = f"[{model_name}] {e}"
                 time.sleep(2)
 
-    return f"LLM 分析请求失败（已重试多次）: {last_error}"
+    return f"LLM 分析请求失败（已尝试所有可用模型）: {last_error}"
 
 
 # ================= 5. Lark & Telegram Webhook 推送 =================
