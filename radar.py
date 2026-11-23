@@ -2,6 +2,7 @@ import os
 import re
 import time
 import hmac
+import random
 import hashlib
 import base64
 import sqlite3
@@ -142,12 +143,15 @@ def detect_anomalies(cur, today_str, today_counts, word_sources):
     return sorted(anomalies, key=lambda x: x["score"], reverse=True)[:22]
 
 
-# ================= 4. 自动发现最新可用 Gemini 模型并分析 =================
+# ================= 4. 多模型高可用调度与分析（防 503 单点拥堵） =================
 def get_latest_available_models():
-    """自动向 Google 查询当前 Key 真正可调用的最新文本模型，排除已下线的旧版本"""
+    """优先使用最新动态别名，并补充官方最新可用模型作为高负载备选"""
     models = []
     if LLM_MODEL:
         models.append(LLM_MODEL.replace("models/", ""))
+
+    # 优先将官方通用动态别名放最前面
+    models.extend(["gemini-flash-latest", "gemini-pro-latest"])
 
     try:
         res = requests.get(
@@ -156,27 +160,19 @@ def get_latest_available_models():
         )
         if res.status_code == 200:
             all_models = res.json().get("models", [])
-            valid_flash = []
-            valid_other = []
+            valid_new = []
             for m in all_models:
                 name = m.get("name", "").replace("models/", "")
                 methods = m.get("supportedGenerationMethods", [])
-                # 必须是支持文本生成的 Gemini 模型，排除已知下线旧版及专用多模态模型
                 if "generateContent" in methods and "gemini" in name.lower():
                     if any(old in name for old in ["2.5", "2.0", "1.5", "1.0", "audio", "image", "tts", "embedding"]):
                         continue
-                    if "flash" in name.lower():
-                        valid_flash.append(name)
-                    else:
-                        valid_other.append(name)
-            valid_flash.sort(reverse=True)
-            valid_other.sort(reverse=True)
-            models.extend(valid_flash + valid_other)
+                    valid_new.append(name)
+            valid_new.sort(reverse=True)
+            models.extend(valid_new)
     except Exception as e:
         print(f"获取可用模型列表失败: {e}")
 
-    # 兜底最新别名
-    models.extend(["gemini-3-flash-preview", "gemini-3.0-flash", "gemini-flash-latest"])
     return list(dict.fromkeys(models))
 
 
@@ -209,10 +205,11 @@ def analyze_with_llm(anomalies, word_contexts):
 """
 
     models_to_try = get_latest_available_models()
-    print(f"自动筛选出的可用新模型候选: {models_to_try[:5]}")
+    print(f"可用模型调度队列: {models_to_try[:5]}")
 
     error_logs = []
-    for model_name in models_to_try[:5]:
+    # 最多轮询 4 个不同模型，每个模型最多重试 3 次，彻底避开单节点 503 高负载
+    for model_name in models_to_try[:4]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={LLM_API_KEY}"
         data = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -220,26 +217,29 @@ def analyze_with_llm(anomalies, word_contexts):
         }
         for attempt in range(3):
             try:
-                res = requests.post(url, json=data, timeout=45)
+                res = requests.post(url, json=data, timeout=60)
                 if res.status_code == 200:
                     result = res.json()
                     print(f"✅ 成功使用模型 [{model_name}] 完成分析！")
                     return result["candidates"][0]["content"]["parts"][0]["text"]
 
-                err_msg = f"[{model_name}] 第{attempt+1}次失败 (HTTP {res.status_code}): {res.text[:150]}"
+                err_msg = f"[{model_name}] 第{attempt+1}次失败 (HTTP {res.status_code}): {res.text[:120]}"
                 print(err_msg)
                 error_logs.append(err_msg)
 
                 if res.status_code in (400, 403, 404):
-                    break
-                time.sleep((attempt + 1) * 4)
+                    break  # 无权限或不存在，立即切换下一个模型
+
+                # 503/429 高负载：指数退避 + 随机抖动 (5s -> 12s -> 22s)
+                wait_sec = (2 ** attempt) * 5 + random.uniform(1, 3)
+                time.sleep(wait_sec)
             except Exception as e:
-                err_msg = f"[{model_name}] 异常: {str(e)[:150]}"
+                err_msg = f"[{model_name}] 请求异常: {str(e)[:120]}"
                 print(err_msg)
                 error_logs.append(err_msg)
-                time.sleep(3)
+                time.sleep(5)
 
-    return "LLM 分析请求失败，详细日志：\n" + "\n".join(error_logs[-2:])
+    return "LLM 分析请求失败（所有候选模型均处于高负载），详细日志：\n" + "\n".join(error_logs[-2:])
 
 
 # ================= 5. Lark & Telegram Webhook 推送 =================
