@@ -154,4 +154,136 @@ def analyze_with_llm(anomalies, word_contexts):
         srcs = ", ".join(item["sources"])
         payload_text += f"- 词条: `{w}` (今日 {item['today']} 次, 7日均 {item['avg_7d']}, 来源平台: {srcs})\n  帖子上下文: {ctx}\n"
 
-    prompt = f"""你是一个敏锐的
+    prompt = f"""你是一个敏锐的独立开发者和 SaaS 市场分析师。
+以下是我从 Hacker News、Reddit、GitHub Trending 和 Product Hunt 抓取的【今日词频异常飙升词条】及其上下文：
+
+{payload_text}
+
+请执行以下任务：
+1. **严格降噪**：剔除通用词、日常动作词或泛概念词。
+2. **优先跨平台信号**：重点关注同时在多个平台（如 GitHub + HN 或 Reddit + ProductHunt）冒头的新技术、新协议、新工具或具体用户痛点。
+3. **输出 3-6 个高价值信号**，使用简洁的中文 Markdown 格式，每条包含：
+   - **关键词**（标注来源平台与今日频次）
+   - **早期信号解读**：结合标题，一句话说明为什么它正在被讨论。
+   - **全栈切入机会**：有没有适合独立开发者的 Micro-SaaS、浏览器插件、API 封装或内容工具机会？（无明显商业机会则注明“纯技术追踪”）
+"""
+
+    models_to_try = ["gemini-2.5-flash", "gemini-2.5-pro"]
+    if LLM_MODEL:
+        clean_model = LLM_MODEL.replace("models/", "")
+        if clean_model not in models_to_try:
+            models_to_try.insert(0, clean_model)
+
+    error_logs = []
+    for model_name in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={LLM_API_KEY}"
+        data = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3}
+        }
+        for attempt in range(3):
+            try:
+                res = requests.post(url, json=data, timeout=45)
+                if res.status_code == 200:
+                    result = res.json()
+                    return result["candidates"][0]["content"]["parts"][0]["text"]
+
+                err_msg = f"[{model_name}] 第{attempt+1}次失败 (HTTP {res.status_code}): {res.text[:150]}"
+                print(err_msg)
+                error_logs.append(err_msg)
+
+                if res.status_code in (400, 403, 404):
+                    break
+                time.sleep((attempt + 1) * 4)
+            except Exception as e:
+                err_msg = f"[{model_name}] 异常: {str(e)[:150]}"
+                print(err_msg)
+                error_logs.append(err_msg)
+                time.sleep(3)
+
+    return "LLM 分析请求失败，详细日志：\n" + "\n".join(error_logs[-2:])
+
+
+# ================= 5. Lark & Telegram Webhook 推送 =================
+def gen_lark_sign(timestamp, secret):
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(hmac_code).decode("utf-8")
+
+
+def send_to_lark(title, markdown_content):
+    if not LARK_WEBHOOK:
+        return
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue"
+            },
+            "elements": [
+                {"tag": "markdown", "content": markdown_content}
+            ]
+        }
+    }
+
+    if LARK_SECRET:
+        timestamp = str(int(time.time()))
+        payload["timestamp"] = timestamp
+        payload["sign"] = gen_lark_sign(timestamp, LARK_SECRET)
+
+    try:
+        res = requests.post(LARK_WEBHOOK, json=payload, timeout=10)
+        result = res.json()
+        if result.get("code") == 0 or result.get("StatusCode") == 0:
+            print("Lark 推送成功！")
+        else:
+            print(f"Lark 推送失败: {result}")
+    except Exception as e:
+        print(f"Lark 推送请求异常: {e}")
+
+
+def send_to_telegram(title, markdown_content):
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    text = f"*{title}*\n\n{markdown_content}"
+    try:
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text[:4000], "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e:
+        print(f"Telegram 推送请求异常: {e}")
+
+
+# ================= 主入口 =================
+if __name__ == "__main__":
+    conn = sqlite3.connect("trends.db")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS word_stats (
+            date TEXT,
+            word TEXT,
+            count INTEGER,
+            PRIMARY KEY (date, word)
+        )
+    """)
+    conn.commit()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    items = fetch_all_sources()
+    print(f"[{today}] 四源合计抓取 {len(items)} 条数据。")
+
+    counts, contexts, sources = extract_ngrams_with_context(items)
+    for word, cnt in counts.items():
+        cur.execute("INSERT OR REPLACE INTO word_stats VALUES (?, ?, ?)", (today, word, cnt))
+    conn.commit()
+
+    anomalies = detect_anomalies(cur, today, counts, sources)
+    report = analyze_with_llm(anomalies, contexts)
+
+    report_title = f"📡 早期需求与趋势雷达 ({today})"
+    print("\n" + report_title + "\n" + report)
+
+    send_to_lark(report_title, report)
+    send_to_telegram(report_title, report)
+    conn.close()
