@@ -36,8 +36,11 @@ STOP_WORDS = {
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
-# ================= 1. 四大早期信号源采集 =================
+# ================= 1. 四大早期信号源采集（含原文链接） =================
 def fetch_all_sources():
+    """
+    返回结构化列表: [{"source": "HN", "title": "...", "url": "https://..."}, ...]
+    """
     items = []
 
     # 1) Hacker News Top 100
@@ -47,7 +50,13 @@ def fetch_all_sources():
             try:
                 item = requests.get(f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json", timeout=5).json()
                 if item and "title" in item:
-                    items.append(f"[HN] {item['title']}")
+                    # 优先取外链，若是 Ask HN / Show HN 无外链则取 HN 讨论页链接
+                    post_url = item.get("url") or f"https://news.ycombinator.com/item?id={item_id}"
+                    items.append({
+                        "source": "HN",
+                        "title": item["title"].strip(),
+                        "url": post_url
+                    })
             except Exception:
                 continue
     except Exception as e:
@@ -59,7 +68,16 @@ def fetch_all_sources():
             url = f"https://www.reddit.com/r/{sub}/rising.json?limit=40"
             res = requests.get(url, headers={"User-Agent": "TrendRadarBot/1.0"}, timeout=10).json()
             for post in res.get("data", {}).get("children", []):
-                items.append(f"[Reddit r/{sub}] {post['data']['title']}")
+                data = post.get("data", {})
+                title = data.get("title", "").strip()
+                permalink = data.get("permalink", "")
+                post_url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
+                if title:
+                    items.append({
+                        "source": f"Reddit r/{sub}",
+                        "title": title,
+                        "url": post_url
+                    })
         except Exception as e:
             print(f"Reddit r/{sub} 抓取异常: {e}")
 
@@ -71,9 +89,15 @@ def fetch_all_sources():
             repo_tag = article.select_one("h2 a")
             desc_tag = article.select_one("p")
             repo_name = repo_tag.get_text(strip=True).replace(" ", "") if repo_tag else ""
+            repo_href = repo_tag.get("href", "").strip() if repo_tag else ""
             desc = desc_tag.get_text(strip=True) if desc_tag else ""
             if repo_name:
-                items.append(f"[GitHub] {repo_name}: {desc}")
+                repo_url = f"https://github.com{repo_href}" if repo_href else f"https://github.com/{repo_name}"
+                items.append({
+                    "source": "GitHub",
+                    "title": f"{repo_name}: {desc}" if desc else repo_name,
+                    "url": repo_url
+                })
     except Exception as e:
         print(f"GitHub Trending 抓取异常: {e}")
 
@@ -84,35 +108,48 @@ def fetch_all_sources():
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         for entry in root.findall("atom:entry", ns)[:30]:
             title_el = entry.find("atom:title", ns)
+            link_el = entry.find("atom:link", ns)
             if title_el is not None and title_el.text:
-                items.append(f"[ProductHunt] {title_el.text.strip()}")
+                ph_url = link_el.attrib.get("href", "") if link_el is not None else ""
+                items.append({
+                    "source": "ProductHunt",
+                    "title": title_el.text.strip(),
+                    "url": ph_url
+                })
     except Exception as e:
         print(f"Product Hunt 抓取异常: {e}")
 
     return items
 
 
-# ================= 2. 词频统计与上下文提取 =================
+# ================= 2. 词频统计与带链接上下文提取 =================
 def extract_ngrams_with_context(items):
     counter = Counter()
     word_contexts = defaultdict(list)
     word_sources = defaultdict(set)
+    seen_urls_per_term = defaultdict(set)
 
-    for full_title in items:
-        source_match = re.match(r"^\[(.*?)\]", full_title)
-        source_name = source_match.group(1).split()[0] if source_match else "Unknown"
-        clean_title = re.sub(r"^\[.*?\]\s*", "", full_title)
+    for entry in items:
+        source_full = entry["source"]
+        source_name = source_full.split()[0]
+        clean_title = entry["title"]
+        url = entry["url"]
 
         words = [w for w in re.findall(r"[a-z0-9\-]+", clean_title.lower()) if w not in STOP_WORDS and len(w) > 2]
         ngrams = set(words)
         bigrams = {f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)}
         all_terms = ngrams.union(bigrams)
 
+        context_str = f"[{source_full}] {clean_title} (链接: {url})" if url else f"[{source_full}] {clean_title}"
+
         for term in all_terms:
             counter[term] += 1
             word_sources[term].add(source_name)
-            if len(word_contexts[term]) < 4:
-                word_contexts[term].append(full_title)
+            # 同一词条下避免重复添加相同链接的上下文，最多保留 4 条代表性帖子
+            if len(word_contexts[term]) < 4 and url not in seen_urls_per_term[term]:
+                word_contexts[term].append(context_str)
+                if url:
+                    seen_urls_per_term[term].add(url)
 
     return counter, word_contexts, word_sources
 
@@ -143,14 +180,13 @@ def detect_anomalies(cur, today_str, today_counts, word_sources):
     return sorted(anomalies, key=lambda x: x["score"], reverse=True)[:22]
 
 
-# ================= 4. 多模型高可用调度与分析（防 503 单点拥堵） =================
+# ================= 4. 多模型高可用调度与分析 =================
 def get_latest_available_models():
     """优先使用最新动态别名，并补充官方最新可用模型作为高负载备选"""
     models = []
     if LLM_MODEL:
         models.append(LLM_MODEL.replace("models/", ""))
 
-    # 优先将官方通用动态别名放最前面
     models.extend(["gemini-flash-latest", "gemini-pro-latest"])
 
     try:
@@ -180,35 +216,38 @@ def analyze_with_llm(anomalies, word_contexts):
     if not anomalies:
         return "今日暂无显著的早期趋势异动。"
     if not LLM_API_KEY:
-        lines = [f"• **{a['word']}** (今日:{a['today']}次 / 来源:{','.join(a['sources'])})" for a in anomalies[:10]]
+        lines = []
+        for a in anomalies[:10]:
+            sample_ctx = word_contexts[a["word"]][0] if word_contexts[a["word"]] else ""
+            lines.append(f"• **{a['word']}** (今日:{a['today']}次 / 来源:{','.join(a['sources'])})\n  {sample_ctx}")
         return "未配置 LLM_API_KEY，以下为原始异动词：\n" + "\n".join(lines)
 
     payload_text = ""
     for item in anomalies:
         w = item["word"]
-        ctx = " | ".join(word_contexts[w])
+        ctx = "\n    * ".join(word_contexts[w])
         srcs = ", ".join(item["sources"])
-        payload_text += f"- 词条: `{w}` (今日 {item['today']} 次, 7日均 {item['avg_7d']}, 来源平台: {srcs})\n  帖子上下文: {ctx}\n"
+        payload_text += f"- 词条: `{w}` (今日 {item['today']} 次, 7日均 {item['avg_7d']}, 来源平台: {srcs})\n  关联原文:\n    * {ctx}\n"
 
     prompt = f"""你是一个敏锐的独立开发者和 SaaS 市场分析师。
-以下是我从 Hacker News、Reddit、GitHub Trending 和 Product Hunt 抓取的【今日词频异常飙升词条】及其上下文：
+以下是我从 Hacker News、Reddit、GitHub Trending 和 Product Hunt 抓取的【今日词频异常飙升词条】及其关联原文与链接：
 
 {payload_text}
 
 请执行以下任务：
 1. **严格降噪**：剔除通用词、日常动作词或泛概念词。
 2. **优先跨平台信号**：重点关注同时在多个平台（如 GitHub + HN 或 Reddit + ProductHunt）冒头的新技术、新协议、新工具或具体用户痛点。
-3. **输出 3-6 个高价值信号**，使用简洁的中文 Markdown 格式，每条包含：
+3. **输出 3-6 个高价值信号**，使用简洁的中文 Markdown 格式，每条严格包含以下四项：
    - **关键词**（标注来源平台与今日频次）
    - **早期信号解读**：结合标题，一句话说明为什么它正在被讨论。
    - **全栈切入机会**：有没有适合独立开发者的 Micro-SaaS、浏览器插件、API 封装或内容工具机会？（无明显商业机会则注明“纯技术追踪”）
+   - **相关原文**：从上面提供的关联原文中挑选 1-2 个最核心的链接，严格使用 `[帖子或项目标题](原始URL)` 格式输出（必须原样使用上方提供的 URL，严禁编造链接）。
 """
 
     models_to_try = get_latest_available_models()
     print(f"可用模型调度队列: {models_to_try[:5]}")
 
     error_logs = []
-    # 最多轮询 4 个不同模型，每个模型最多重试 3 次，彻底避开单节点 503 高负载
     for model_name in models_to_try[:4]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={LLM_API_KEY}"
         data = {
@@ -228,9 +267,8 @@ def analyze_with_llm(anomalies, word_contexts):
                 error_logs.append(err_msg)
 
                 if res.status_code in (400, 403, 404):
-                    break  # 无权限或不存在，立即切换下一个模型
+                    break
 
-                # 503/429 高负载：指数退避 + 随机抖动 (5s -> 12s -> 22s)
                 wait_sec = (2 ** attempt) * 5 + random.uniform(1, 3)
                 time.sleep(wait_sec)
             except Exception as e:
@@ -288,7 +326,7 @@ def send_to_telegram(title, markdown_content):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     text = f"*{title}*\n\n{markdown_content}"
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text[:4000], "parse_mode": "Markdown"}, timeout=10)
+        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text[:4000], "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=10)
     except Exception as e:
         print(f"Telegram 推送请求异常: {e}")
 
@@ -309,7 +347,7 @@ if __name__ == "__main__":
 
     today = datetime.now().strftime("%Y-%m-%d")
     items = fetch_all_sources()
-    print(f"[{today}] 四源合计抓取 {len(items)} 条数据。")
+    print(f"[{today}] 四源合计抓取 {len(items)} 条带链接数据。")
 
     counts, contexts, sources = extract_ngrams_with_context(items)
     for word, cnt in counts.items():
